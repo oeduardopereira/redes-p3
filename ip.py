@@ -1,3 +1,5 @@
+import struct
+
 from iputils import *
 
 
@@ -13,6 +15,7 @@ class IP:
         self.enlace.registrar_recebedor(self.__raw_recv)
         self.ignore_checksum = self.enlace.ignore_checksum
         self.meu_endereco = None
+        self.tabela = []
 
     def __raw_recv(self, datagrama):
         dscp, ecn, identification, flags, frag_offset, ttl, proto, \
@@ -28,10 +31,15 @@ class IP:
             self.enlace.enviar(datagrama, next_hop)
 
     def _next_hop(self, dest_addr):
-        # TODO: Use a tabela de encaminhamento para determinar o próximo salto
-        # (next_hop) a partir do endereço de destino do datagrama (dest_addr).
-        # Retorne o next_hop para o dest_addr fornecido.
-        pass
+        dest = struct.unpack('!I', str2addr(dest_addr))[0]
+        # fica com a entrada de prefixo mais longo que casar
+        escolhido = None
+        bits_escolhido = -1
+        for rede, mascara, bits, next_hop in self.tabela:
+            if (dest & mascara) == rede and bits > bits_escolhido:
+                bits_escolhido = bits
+                escolhido = next_hop
+        return escolhido
 
     def definir_endereco_host(self, meu_endereco):
         """
@@ -49,9 +57,15 @@ class IP:
         Onde os CIDR são fornecidos no formato 'x.y.z.w/n', e os
         next_hop são fornecidos no formato 'x.y.z.w'.
         """
-        # TODO: Guarde a tabela de encaminhamento. Se julgar conveniente,
-        # converta-a em uma estrutura de dados mais eficiente.
-        pass
+        # guardo já com a rede e a máscara em número, para facilitar na hora
+        # de comparar com o endereço de destino
+        self.tabela = []
+        for cidr, next_hop in tabela:
+            endereco, prefixo = cidr.split('/')
+            prefixo = int(prefixo)
+            mascara = (0xffffffff << (32 - prefixo)) & 0xffffffff if prefixo else 0
+            rede = struct.unpack('!I', str2addr(endereco))[0] & mascara
+            self.tabela.append((rede, mascara, prefixo, next_hop))
 
     def registrar_recebedor(self, callback):
         """
@@ -65,6 +79,19 @@ class IP:
         (string no formato x.y.z.w).
         """
         next_hop = self._next_hop(dest_addr)
-        # TODO: Assumindo que a camada superior é o protocolo TCP, monte o
-        # datagrama com o cabeçalho IP, contendo como payload o segmento.
+        # a camada de cima é o TCP, então monta o cabeçalho IP na mão
+        if self.meu_endereco is None:
+            src_addr = '0.0.0.0'
+        else:
+            src_addr = self.meu_endereco
+        total_len = 20 + len(segmento)
+        cabecalho = struct.pack('!BBHHHBBHII',
+                                0x45, 0, total_len, 0, 0,
+                                64, IPPROTO_TCP, 0,
+                                struct.unpack('!I', str2addr(src_addr))[0],
+                                struct.unpack('!I', str2addr(dest_addr))[0])
+        # calcula o checksum com o campo zerado e depois coloca ele no lugar
+        checksum = calc_checksum(cabecalho)
+        cabecalho = cabecalho[:10] + struct.pack('!H', checksum) + cabecalho[12:]
+        datagrama = cabecalho + segmento
         self.enlace.enviar(datagrama, next_hop)
