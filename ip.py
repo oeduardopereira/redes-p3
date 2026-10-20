@@ -35,6 +35,10 @@ class IP:
         # em vez de ser encaminhado com ttl zero
         ttl = ttl - 1
         if ttl <= 0:
+            icmp = struct.pack('!BBHI', 11, 0, 0, 0) + datagrama[:28]
+            checksum = calc_checksum(icmp)
+            icmp = icmp[:2] + struct.pack('!H', checksum) + icmp[4:]
+            self.enviar(icmp, src_addr, IPPROTO_ICMP)
             return
 
         # bytes são imutáveis, então uso um bytearray para poder alterar o pacote
@@ -101,7 +105,7 @@ class IP:
         """
         self.callback = callback
 
-    def enviar(self, segmento, dest_addr):
+    def enviar(self, segmento, dest_addr, proto=IPPROTO_TCP):
         """
         Envia segmento para dest_addr, onde dest_addr é um endereço IPv4
         (string no formato x.y.z.w).
@@ -122,7 +126,7 @@ class IP:
         identificacao = 0
         flags_offset = 0
         ttl = 64
-        protocolo = IPPROTO_TCP
+        protocolo = proto
         checksum = 0
 
         cabecalho = struct.pack('!BBHHHBBHII',
