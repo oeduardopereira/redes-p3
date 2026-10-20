@@ -18,28 +18,62 @@ class IP:
         self.tabela = []
 
     def __raw_recv(self, datagrama):
+        # primeiro separa o cabeçalho do resto do datagrama
         dscp, ecn, identification, flags, frag_offset, ttl, proto, \
            src_addr, dst_addr, payload = read_ipv4_header(datagrama)
+
         if dst_addr == self.meu_endereco:
-            # atua como host
-            if proto == IPPROTO_TCP and self.callback:
+            # é para mim, então entrego para a camada de cima
+            if proto == IPPROTO_TCP and self.callback is not None:
                 self.callback(src_addr, dst_addr, payload)
-        else:
-            # atua como roteador
-            next_hop = self._next_hop(dst_addr)
-            # TODO: Trate corretamente o campo TTL do datagrama
-            self.enlace.enviar(datagrama, next_hop)
+            return
+
+        # se não é para mim, tenho que repassar (estou fazendo papel de roteador)
+        #
+        # o ttl é decrementado a cada roteador. ttl 1 significa que esse é o
+        # último salto possível, então o pacote tem que ser descartado aqui
+        # em vez de ser encaminhado com ttl zero
+        ttl = ttl - 1
+        if ttl <= 0:
+            return
+
+        # bytes são imutáveis, então uso um bytearray para poder alterar o pacote
+        pacote = bytearray(datagrama)
+        pacote[8] = ttl
+
+        # o checksum do cabeçalho depende do ttl, então tenho que zerar o campo
+        # e calcular ele de novo, senão o próximo roteador vai descartar o pacote
+        pacote[10] = 0
+        pacote[11] = 0
+        tamanho_cabecalho = (pacote[0] & 0x0F) * 4
+        checksum = calc_checksum(bytes(pacote[:tamanho_cabecalho]))
+        pacote[10:12] = struct.pack('!H', checksum)
+
+        next_hop = self._next_hop(dst_addr)
+        self.enlace.enviar(bytes(pacote), next_hop)
 
     def _next_hop(self, dest_addr):
-        dest = struct.unpack('!I', str2addr(dest_addr))[0]
-        # fica com a entrada de prefixo mais longo que casar
-        escolhido = None
-        bits_escolhido = -1
-        for rede, mascara, bits, next_hop in self.tabela:
-            if (dest & mascara) == rede and bits > bits_escolhido:
-                bits_escolhido = bits
-                escolhido = next_hop
-        return escolhido
+        destino = struct.unpack('!I', str2addr(dest_addr))[0]
+
+        # vou guardando o candidato com o maior prefixo encontrado até agora
+        melhor_next_hop = None
+        maior_prefixo = -1
+
+        for cidr, next_hop in self.tabela:
+            rede_str, prefixo_str = cidr.split('/')
+            prefixo = int(prefixo_str)
+
+            # monta uma máscara com "prefixo" bits 1 seguidos de zeros
+            mascara = ((1 << prefixo) - 1) << (32 - prefixo)
+            rede = struct.unpack('!I', str2addr(rede_str))[0]
+
+            if (destino & mascara) == (rede & mascara):
+                # se casar com mais de uma entrada, a mais específica ganha
+                if prefixo > maior_prefixo:
+                    maior_prefixo = prefixo
+                    melhor_next_hop = next_hop
+
+        return melhor_next_hop
 
     def definir_endereco_host(self, meu_endereco):
         """
@@ -57,15 +91,9 @@ class IP:
         Onde os CIDR são fornecidos no formato 'x.y.z.w/n', e os
         next_hop são fornecidos no formato 'x.y.z.w'.
         """
-        # guardo já com a rede e a máscara em número, para facilitar na hora
-        # de comparar com o endereço de destino
-        self.tabela = []
-        for cidr, next_hop in tabela:
-            endereco, prefixo = cidr.split('/')
-            prefixo = int(prefixo)
-            mascara = (0xffffffff << (32 - prefixo)) & 0xffffffff if prefixo else 0
-            rede = struct.unpack('!I', str2addr(endereco))[0] & mascara
-            self.tabela.append((rede, mascara, prefixo, next_hop))
+        # por enquanto guardo a tabela do jeito que veio mesmo, e faço a
+        # conversão na hora de procurar o next_hop
+        self.tabela = list(tabela)
 
     def registrar_recebedor(self, callback):
         """
@@ -79,19 +107,34 @@ class IP:
         (string no formato x.y.z.w).
         """
         next_hop = self._next_hop(dest_addr)
-        # a camada de cima é o TCP, então monta o cabeçalho IP na mão
+
         if self.meu_endereco is None:
-            src_addr = '0.0.0.0'
+            origem = '0.0.0.0'
         else:
-            src_addr = self.meu_endereco
-        total_len = 20 + len(segmento)
+            origem = self.meu_endereco
+
+        # cabeçalho IPv4 sem opções: versão 4, ihl 5, tos 0, etc.
+        # o checksum começa zerado porque só dá para calcular depois de montar
+        # o cabeçalho inteiro
+        versao_ihl = 0x45
+        dscp_ecn = 0
+        tamanho_total = 20 + len(segmento)
+        identificacao = 0
+        flags_offset = 0
+        ttl = 64
+        protocolo = IPPROTO_TCP
+        checksum = 0
+
         cabecalho = struct.pack('!BBHHHBBHII',
-                                0x45, 0, total_len, 0, 0,
-                                64, IPPROTO_TCP, 0,
-                                struct.unpack('!I', str2addr(src_addr))[0],
+                                versao_ihl, dscp_ecn, tamanho_total,
+                                identificacao, flags_offset, ttl,
+                                protocolo, checksum,
+                                struct.unpack('!I', str2addr(origem))[0],
                                 struct.unpack('!I', str2addr(dest_addr))[0])
+
         # calcula o checksum com o campo zerado e depois coloca ele no lugar
         checksum = calc_checksum(cabecalho)
         cabecalho = cabecalho[:10] + struct.pack('!H', checksum) + cabecalho[12:]
+
         datagrama = cabecalho + segmento
         self.enlace.enviar(datagrama, next_hop)
